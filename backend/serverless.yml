@@ -1,0 +1,684 @@
+org: phuongloan
+app: serverless-phuongloan
+service: serverless-phuongloan
+frameworkVersion: '3'
+
+plugins:
+  - serverless-webpack
+  - serverless-iam-roles-per-function
+  - serverless-plugin-tracing
+  - serverless-reqvalidator-plugin
+  - serverless-aws-documentation
+
+custom:
+  webpack:
+    webpackConfig: ./webpack.config.js
+    includeModules: true
+
+
+provider:
+  name: aws
+  runtime: nodejs16.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+
+  tracing:
+    lambda: true
+    apiGateway: true
+
+  environment:
+    POST_TABLE: TABLE-${self:provider.stage}
+    ATTACHMENT_S3_BUCKET: phuongloan-serverless-${self:provider.stage}
+    POST_CREATED_AT_INDEX: CreatedAtIndex
+    SIGNED_URL_EXPIRATION: 300
+
+  logs:
+  # Enable API Gateway logs
+    restApi: true
+
+functions:
+  Auth:
+    handler: src/lambda/auth/auth0Authorizer.handler
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'xray:PutTraceSegments'
+          - 'xray:PutTelemetryRecords'
+        Resource:
+          - '*'
+
+  GetPosts:
+    handler: src/lambda/http/getPosts.handler
+    events:
+      - http:
+          method: get
+          path: posts
+          cors: true
+          reqValidatorName: BodyValidator
+          authorizer:
+            name: Auth
+            resultTtlInSeconds: 0
+            identitySource: method.request.header.Authorization
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'xray:PutTraceSegments'
+          - 'xray:PutTelemetryRecords'
+        Resource:
+          - '*'
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+        Resource: arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}/index/${self:provider.environment.POST_CREATED_AT_INDEX}
+
+  # TODO: Configure this function -
+  CreatePost:
+    handler: src/lambda/http/createPost.handler
+    events:
+      - http:
+          method: post
+          path: posts
+          cors: true
+          reqValidatorName: BodyValidator
+          authorizer:
+            name: Auth
+            resultTtlInSeconds: 0
+            identitySource: method.request.header.Authorization
+          request:
+            schemas:
+              application/json: ${file(models/create-post-model.json)}
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'xray:PutTraceSegments'
+          - 'xray:PutTelemetryRecords'
+        Resource:
+          - '*'
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource: 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}'
+
+  UpdatePost:
+    handler: src/lambda/http/updatePost.handler
+    events:
+      - http:
+          method: patch
+          path: posts/{postId}
+          cors: true
+          reqValidatorName: BodyValidator
+          authorizer:
+            name: Auth
+            resultTtlInSeconds: 0
+            identitySource: method.request.header.Authorization
+          request:
+            schemas:
+              application/json: ${file(models/update-post-model.json)}
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'xray:PutTraceSegments'
+          - 'xray:PutTelemetryRecords'
+        Resource:
+          - '*'
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}'
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+        Resource: 'arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*'
+
+  DeletePost:
+    handler: src/lambda/http/deletePost.handler
+    events:
+      - http:
+          method: delete
+          path: posts/{postId}
+          cors: true
+          reqValidatorName: BodyValidator
+          authorizer:
+            name: Auth
+            resultTtlInSeconds: 0
+            identitySource: method.request.header.Authorization
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'xray:PutTraceSegments'
+          - 'xray:PutTelemetryRecords'
+        Resource:
+          - '*'
+      - Effect: Allow
+        Action:
+          - dynamodb:DeleteItem
+        Resource: 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}'
+
+  GenerateUploadUrl:
+    handler: src/lambda/http/generateUploadUrl.handler
+    events:
+      - http:
+          cors: true
+          method: post
+          path: posts/{postId}/attachment
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - 'xray:PutTraceSegments'
+          - 'xray:PutTelemetryRecords'
+        Resource:
+          - '*'
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}'
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+        Resource: 'arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*'
+
+resources:
+  Resources:
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: ApiGatewayRestApi
+
+    # TODO: Create a DynamoDB table with local secondary index and a composite key
+    PostTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.POST_TABLE}
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: postId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: postId
+            KeyType: RANGE
+        LocalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.POST_CREATED_AT_INDEX}
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        BillingMode: PAY_PER_REQUEST
+
+    AttachmentsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.ATTACHMENT_S3_BUCKET}
+        OwnershipControls:
+          Rules:
+            - ObjectOwnership: ObjectWriter
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: false
+          BlockPublicPolicy: false
+          IgnorePublicAcls: false
+          RestrictPublicBuckets: false
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+                - DELETE
+                - HEAD
+              AllowedOrigins:
+                - '*'
+              MaxAge: 93000
+
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref AttachmentsBucket
+        PolicyDocument:
+          Id: LoanPolicy
+          Version: '2012-10-17'
+          Statement:
+            - Sid: PublicBucketObjects
+              Effect: Allow
+              Principal: '*'
+              Action: s3:*
+              Resource: 'arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*'
+    # Body validator
+    BodyValidator:
+      Type: AWS::ApiGateway::RequestValidator
+      Properties:
+        Name: 'body-validator'
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        ValidateRequestBody: true
+        ValidateRequestParameters: false
+
+# TODO: Change the name of the org 
+# org: phuongloan
+# app: serverless-post-app-5
+# service: serverless-post-app-5
+# frameworkVersion: '3.23.0'
+
+# plugins:
+#   - serverless-webpack
+#   - serverless-iam-roles-per-function
+#   - serverless-plugin-tracing
+#   - serverless-reqvalidator-plugin
+#   - serverless-aws-documentation
+
+# provider:
+#   name: aws
+#   runtime: nodejs18.x
+#   #lambdaHashingVersion: '20201221'
+
+#   stage: ${opt:stage, 'dev'}
+#   region: ${opt:region, 'us-east-1'}
+
+#   tracing:
+#     lambda: true
+#     apiGateway: true
+
+#   # Use these variables in the functions and resouorces section below. For example, 
+#   # ${self:provider.environment.ATTACHMENT_S3_BUCKET}
+#   environment:
+#     POST_TABLE: Serverless-c5-post-app-5-${self:provider.stage}
+#     POST_CREATED_AT_INDEX: CreatedAtIndex
+#     ATTACHMENT_S3_BUCKET: serverless-c5-post-app-5-images-1-${self:provider.stage}
+#     SIGNED_URL_EXPIRATION: 300
+#     PROJECT_NAME: serverless-post-app-5
+#     INDEX_NAME: ${self:provider.environment.POST_CREATED_AT_INDEX}
+
+# custom:
+#   documentation:
+#     api:
+#       info:
+#         version: v1.0.0
+#         title: Post App
+#         description: Serverless application for post monitoring
+#     models:
+#       - name: CreatePostRequest
+#         contentType: application/json
+#         schema: ${file(models/create-post-model.json)}
+#       - name: UpdatePostRequest
+#         contentType: application/json
+#         schema: ${file(models/update-post-model.json)}
+
+#   logs:
+#     # Enable API Gateway logs
+#     restApi: true
+
+# functions:
+#   Auth:
+#    handler: src/lambda/auth/auth0Authorizer.handler
+#    iamRoleStatements:
+#       - Effect: "Allow"
+#         Action:
+#           - "xray:PutTraceSegments"
+#           - "xray:PutTelemetryRecords"
+#         Resource:
+#           - "*"
+
+#   # TODO: Configure this function - 
+#   # Provide iamRoleStatements property for performing Actions on DynamoDB
+
+#   GetPosts:
+#     handler: src/lambda/http/getPosts.handler
+#     events:
+#       - http:
+#           method: get
+#           path: post
+#           cors: true
+#           authorizer: Auth
+#     iamRoleStatementName: ${self:provider.environment.PROJECT_NAME}-get-post-role-${self:provider.stage}
+#     iamRoleStatements:
+#       - Effect: Allow
+#         Action:
+#           - dynamodb:Query
+#         Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}
+#       - Effect: Allow
+#         Action:
+#           - dynamodb:Query
+#         Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}/index/${self:provider.environment.POST_CREATED_AT_INDEX}
+#       - Effect: Allow
+#         Action:
+#           - xray:PutTraceSegments
+#           - xray:PutTelemetryRecords
+#         Resource:
+#           - '*'
+
+#   # TODO: Configure this function - 
+#   # Provide iamRoleStatements property. Decide the Actions and AWS Resource. 
+#   # To refer to an AWS resource defined in the "Resources" section, you can use "Resource: !GetAtt <resource-name>.Arn"
+#   # To validate incoming HTTP requests, we have provided the request schemas in function definition below. 
+#   CreatePost:
+#     handler: src/lambda/http/createPost.handler
+#     events:
+#       - http:
+#           method: post
+#           path: post
+#           cors: true
+#           # authorizer: Auth
+#           # request:
+#           #   schemas:
+#           #     application/json: ${file(models/create-post-model.json)}
+#           documentation:
+#             summary: Create a new post 
+#             description: Create a post task
+#             requestModels:
+#               'application/json': CreatePostRequest
+#           reqValidatorName: RequestBodyValidator
+#     iamRoleStatements:
+#       - Effect: Allow
+#         Action:
+#           - dynamodb:PutItem
+#         Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}
+#       - Effect: Allow
+#         Action:
+#           - xray:PutTraceSegments
+#           - xray:PutTelemetryRecords
+#         Resource:
+#           - '*'
+#     #   - Effect: Allow
+#     #     Action:
+#     #       - xray:PutTraceSegments
+#     #     Resource:
+#     #       - '*'
+
+#   # TODO: Configure this function
+#   # Provide property for setting up CORS, Authorizer, iamRoleStatements, and request schemas
+#   UpdatePost:
+#     handler: src/lambda/http/updatePost.handler
+#     events:
+#       - http:
+#           method: patch
+#           path: post/{postId}
+#           cors: true
+#           authorizer: Auth
+#           reqValidatorName: RequestBodyValidator
+#           documentation:
+#             summary: Update a new POST
+#             description: Update a new POST
+#             requestModels:
+#               'application/json': UpdatePostRequest
+#     #iamRoleStatementName: ${self:provider.environment.PROJECT_NAME}-update-post-role-${self:provider.stage}
+#     iamRoleStatements:
+#       - Effect: Allow
+#         Action:
+#           - dynamodb:UpdateItem 
+#         Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}
+#       - Effect: Allow
+#         Action:
+#           - xray:PutTraceSegments
+#           - xray:PutTelemetryRecords
+#         Resource:
+#           - '*'
+
+#   # TODO: Configure this function
+#   # Provide property for setting up CORS, Authorizer, iamRoleStatements
+#   # DeleteTodo:
+#   #   handler: src/lambda/http/deleteTodo.handler
+#   #   events:
+#   #     - http:
+#   #         method: delete
+#   #         path: todos/{todoId}
+#   DeletePost:
+#     handler: src/lambda/http/deletePost.handler
+#     events:
+#       - http:
+#           method: delete
+#           path: post/{postId}
+#           cors: true
+#           authorizer: Auth
+#     # iamRoleStatementName: ${self:provider.environment.PROJECT_NAME}-delete-todo-role-${self:provider.stage}
+#     iamRoleStatements:
+#       - Effect: Allow
+#         Action:
+#           - dynamodb:DeleteItem 
+#         Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}
+#       - Effect: Allow
+#         Action:
+#           - xray:PutTraceSegments
+#           - xray:PutTelemetryRecords
+#         Resource:
+#           - '*'
+
+#   # TODO: Configure this function
+#   # Provide property for setting up CORS, Authorizer, iamRoleStatements
+#   # GenerateUploadUrl:
+#   #   handler: src/lambda/http/generateUploadUrl.handler
+#   #   events:
+#   #     - http:
+#   #         method: post
+#   #         path: todos/{todoId}/attachment
+#   GenerateUploadUrl:
+#     handler: src/lambda/http/generateUploadUrl.handler
+#     events:
+#       - http:
+#           method: post
+#           path: post/{postId}/attachment
+#           cors: true
+#           authorizer: Auth
+#     iamRoleStatementName: ${self:provider.environment.PROJECT_NAME}-generate-s3-upload-url-role-${self:provider.stage}
+#     iamRoleStatements:
+#       - Effect: Allow
+#         Action:
+#           - s3:*
+#         Resource: arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*
+#       - Effect: Allow
+#         Action:
+#           - dynamodb:UpdateItem
+#         Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.POST_TABLE}
+#       - Effect: Allow
+#         Action:
+#           - xray:PutTraceSegments
+#           - xray:PutTelemetryRecords
+#         Resource:
+#           - '*'  
+
+# # resources:
+# #   Resources:
+# #     # Add necessary AWS resources. You will need at least the following AWS resources
+# #     # TODO: Fill the properties
+# #     # Feel free to change the names as you like. 
+# #     GatewayResponseDefault4XX:
+# #       Type: AWS::ApiGateway::GatewayResponse
+# #       Properties:
+# #         ResponseParameters:
+# #           gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+# #           gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+# #           gatewayresponse.header.Access-Control-Allow-Methods: "'GET, POST, PUT, DELETE, OPTIONS'"
+# #         ResponseType: DEFAULT_4XX
+# #         RestApiId:
+# #           Ref: ApiGatewayRestApi
+# #     RequestBodyValidator:
+# #       Type: AWS::ApiGateway::RequestValidator
+# #       Properties:
+# #         Name: 'request-body-validator'
+# #         RestApiId:
+# #           Ref: 'ApiGatewayRestApi'
+# #         ValidateRequestBody: true
+# #         ValidateRequestParameters: false
+        
+    
+# #     # TODO: Create a DynamoDB table with local secondary index and a composite key
+# #     TodosTable:
+# #       Type: AWS::DynamoDB::Table
+# #       Properties:
+# #         AttributeDefinitions:
+# #           - AttributeName: userId
+# #             AttributeType: S
+# #           - AttributeName: todoId
+# #             AttributeType: S
+# #           # - AttributeName: createdAt
+# #           #   AttributeType: S
+# #         KeySchema:
+# #           - AttributeName: userId
+# #             KeyType: HASH
+# #           - AttributeName: todoId
+# #             KeyType: RANGE
+# #         BillingMode: PAY_PER_REQUEST
+# #         TableName: ${self:provider.environment.TODOS_TABLE}
+# #         LocalSecondaryIndexes:
+# #           - IndexName: ${self:provider.environment.TODOS_CREATED_AT_INDEX}
+# #             KeySchema:
+# #               - AttributeName: userId
+# #                 KeyType: HASH
+# #               - AttributeName: todoId
+# #                 KeyType: RANGE
+# #             Projection:
+# #               ProjectionType: ALL
+              
+
+# #     # TODO: Complete the bucket properties below. 
+# #     # Do not forget to add the CorsConfiguration propoerty
+# #     AttachmentsBucket:
+# #       Type: AWS::S3::Bucket
+# #       Properties:
+# #         BucketName: ${self:provider.environment.ATTACHMENT_S3_BUCKET}
+# #         OwnershipControls:
+# #           Rules:
+# #             - ObjectOwnership: ObjectWriter
+# #         PublicAccessBlockConfiguration:
+# #           BlockPublicAcls: false
+# #           BlockPublicPolicy: false
+# #           IgnorePublicAcls: false
+# #           RestrictPublicBuckets: false
+# #         CorsConfiguration:
+# #           CorsRules:
+# #             - AllowedHeaders:
+# #                 - "*"
+# #               AllowedMethods:
+# #                 - GET
+# #                 - POST
+# #                 - PUT
+# #                 - DELETE
+# #                 - HEAD
+# #               AllowedOrigins:
+# #                 - "*"
+
+# #               MaxAge: 3000
+
+# #     # TODO: Complete the policy below and attach it to the bucket defined above
+# #     # For cross referencing the name of the bucket, use "!Ref AttachmentsBucket"
+# #     BucketPolicy:
+# #       Type: AWS::S3::BucketPolicy
+# #       Properties:
+# #         PolicyDocument:
+# #           Id: UdacityServerlessTodo
+# #           Version: "2012-10-17"
+# #           Statement:
+# #             - Sid: PublicReadForGetBucketObjects
+# #               Effect: Allow
+# #               Principal: "*"
+# #               Action: "s3:GetObject"
+# #               Resource: "arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*"
+# #         Bucket: !Ref AttachmentsBucket
+
+
+# resources:
+#   Resources:
+#     GatewayResponseDefault4XX:
+#       Type: AWS::ApiGateway::GatewayResponse
+#       Properties:
+#         ResponseParameters:
+#           gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+#         ResponseType: DEFAULT_4XX
+#         RestApiId:
+#           Ref: ApiGatewayRestApi
+
+#     # TODO: Create a DynamoDB table with local secondary index and a composite key
+#     PostTable:
+#       Type: AWS::DynamoDB::Table
+#       Properties:
+#         TableName: ${self:provider.environment.POST_TABLE}
+#         AttributeDefinitions:
+#           - AttributeName: userId
+#             AttributeType: S
+#           - AttributeName: postId
+#             AttributeType: S
+#           - AttributeName: createdAt
+#             AttributeType: S
+#         KeySchema:
+#           - AttributeName: userId
+#             KeyType: HASH
+#           - AttributeName: postId
+#             KeyType: RANGE
+#         LocalSecondaryIndexes:
+#           - IndexName: ${self:provider.environment.POST_CREATED_AT_INDEX}
+#             KeySchema:
+#               - AttributeName: userId
+#                 KeyType: HASH
+#               - AttributeName: createdAt
+#                 KeyType: RANGE
+#             Projection:
+#               ProjectionType: ALL
+#         BillingMode: PAY_PER_REQUEST
+
+#     AttachmentsBucket:
+#       Type: AWS::S3::Bucket
+#       Properties:
+#         BucketName: ${self:provider.environment.ATTACHMENT_S3_BUCKET}
+#         OwnershipControls:
+#           Rules:
+#             - ObjectOwnership: ObjectWriter
+#         PublicAccessBlockConfiguration:
+#           BlockPublicAcls: false
+#           BlockPublicPolicy: false
+#           IgnorePublicAcls: false
+#           RestrictPublicBuckets: false
+#         CorsConfiguration:
+#           CorsRules:
+#             - AllowedHeaders:
+#                 - '*'
+#               AllowedMethods:
+#                 - GET
+#                 - PUT
+#                 - POST
+#                 - DELETE
+#                 - HEAD
+#               AllowedOrigins:
+#                 - '*'
+#               MaxAge: 93000
+
+#     BucketPolicy:
+#       Type: AWS::S3::BucketPolicy
+#       Properties:
+#         Bucket: !Ref AttachmentsBucket
+#         PolicyDocument:
+#           Id: Policy
+#           Version: '2012-10-17'
+#           Statement:
+#             - Sid: PublicBucketObjects
+#               Effect: Allow
+#               Principal: '*'
+#               Action: s3:*
+#               Resource: 'arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*'
+#     # Body validator
+#     BodyValidator:
+#       Type: AWS::ApiGateway::RequestValidator
+#       Properties:
+#         Name: 'body-validator'
+#         RestApiId:
+#           Ref: ApiGatewayRestApi
+#         ValidateRequestBody: true
+#         ValidateRequestParameters: false
